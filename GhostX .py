@@ -529,9 +529,9 @@ def apply_custom_header_footer(text, header, footer):
     return result.strip()
 
 # Event Handlers
-@client.on(events.NewMessage(pattern='(?i)^/start$'))
+@client.on(events.NewMessage(pattern='(?i)^/sx$'))
 async def start(event):
-    """Handle /start command."""
+    """Handle /sx command."""
     global OWNER_ID
     OWNER_ID = event.sender_id
     if not SILENT_MODE:
