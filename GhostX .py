@@ -1,7 +1,13 @@
+import os
+import logging
+from dotenv import load_dotenv
+from collections import deque
+from telethon import TelegramClient, events
 import asyncio
 import logging
 import json
 import re
+import uuid
 import shutil
 import random
 import hashlib
@@ -233,7 +239,7 @@ def clean_image(image):
     try:
         image = image.convert('RGB')
         pixels = image.load()
-        for x in range(0, eight.width, 20):
+        for x in range(0, image.width, 20):
             for y in range(0, image.height, 20):
                 r, g, b = pixels[x, y]
                 pixels[x, y] = (r ^ 1, g ^ 1, b ^ 1)  # Flip 1 bit to disrupt pHash/dHash
@@ -375,7 +381,7 @@ async def copy_message_with_retry(event, mapping, user_id, pair_name):
                 message_text, original_entities = await client._parse_message_text(message_text, parse_mode='html')
 
             # Random delay with jitter for anti-time slot fingerprinting
-            delay_range = REPLY_DELAY_RANGE if is_reply else mapping.get('delay_range', DEFAULT_DELAY_RANGE)
+            delay_range = REPLY_DELAY_RANGE = [1.5, 3.0] if is_reply else mapping.get('delay_range', DEFAULT_DELAY_RANGE)
             if FAST_MODE:
                 base_delay = random.uniform(*DEFAULT_DELAY_RANGE) + random.uniform(-0.2, 0.2)
                 anti_fingerprint_delay = random.uniform(*ANTI_FINGERPRINT_DELAY_RANGE)
@@ -697,8 +703,8 @@ async def toggle_fast_mode(event):
     arg = event.pattern_match.group(1).lower()
     if arg == "on":
         FAST_MODE = True
-        DEFAULT_DELAY_RANGE = [0.5, 1.5]
-        ANTI_FINGERPRINT_DELAY_RANGE = [0.5, 1.5]
+        DEFAULT_DELAY_RANGE = [1, 2]
+        ANTI_FINGERPRINT_DELAY_RANGE = [1, 5]
         old_num_workers = NUM_WORKERS
         NUM_WORKERS = 10
         await event.reply("🚀 FAST MODE ENABLED\nBot will forward quickly with stealth.")
@@ -707,7 +713,7 @@ async def toggle_fast_mode(event):
         DEFAULT_DELAY_RANGE = [1, 5]
         ANTI_FINGERPRINT_DELAY_RANGE = [2, 5]
         old_num_workers = NUM_WORKERS
-        NUM_WORKERS = 5
+        NUM_WORKERS = 3
         await event.reply("🐢 NORMAL MODE ENABLED\nStandard delay and throughput restored.")
 
     # Adjust worker tasks
