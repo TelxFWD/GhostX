@@ -35,12 +35,14 @@ MAX_MAPPING_HISTORY = 1000
 INACTIVITY_THRESHOLD = 172800  # 6 hours in seconds
 MAX_MESSAGE_LENGTH = 4096  # Telegram's max message length
 QUEUE_INACTIVITY_THRESHOLD = 600  # 10 minutes in seconds
-NUM_WORKERS = 3
-DEFAULT_DELAY_RANGE = [1.0, 8.0]  # Default min/max delay in seconds
-REPLY_DELAY_RANGE = [3.0, 12.0]  # Delay range for replies
+FAST_MODE = False
+scramble_content_enabled = True
+DEFAULT_DELAY_RANGE = [1, 5]
+ANTI_FINGERPRINT_DELAY_RANGE = [2, 5]
+NUM_WORKERS = 5
 JITTER = 0.5  # ±0.5s jitter for delays
 SILENT_MODE = False  # Disable verbose command outputs
-NOTIFY_OWNER = True  # Disable owner notifications unless enabled
+NOTIFY_OWNER = True  # Enable owner notifications
 
 # Logging setup
 logging.basicConfig(
@@ -59,6 +61,10 @@ message_queue = deque(maxlen=MAX_QUEUE_SIZE)
 is_connected = False
 pair_stats = {}
 OWNER_ID = None
+worker_tasks = []
+
+# Known trap patterns
+TRAP_VARIANTS = ["🔥 Black Dragon Entry 🔥", "EURUSD Buy @"]
 
 # Helper Functions
 def save_mappings():
@@ -122,20 +128,67 @@ def remove_patterns(text, patterns):
         return '\n'.join(filtered_lines).strip()
     return text
 
-def scramble_content(text, mapping):
-    """Scramble content to evade detection if content_scramble is enabled."""
-    if not text or not mapping.get('content_scramble', False):
+def strip_invisible_characters(text):
+    """Remove invisible Unicode characters to prevent fingerprinting."""
+    if not text:
         return text
-    lines = text.split('\n')
+    return ''.join(c for c in text if unicodedata.category(c)[0] != 'C')
+
+def log_fingerprint(text, timestamp, pair_name):
+    """Log SHA256 fingerprint of text for reverse detection protection."""
+    h = hashlib.sha256(text.encode()).hexdigest()[:12]
+    logger.info(f"🧬 Fingerprint [{h}] for pair {pair_name} at {timestamp}")
+    return h
+
+def scramble_content_safe(text, entities=None):
+    """Scramble content safely, preserving formatting entities."""
+    if not text:
+        return text, entities
+    text = strip_invisible_characters(text)  # Strip invisible characters
+    lines = [line for line in text.split('\n') if line.strip()]
+    
+    # Adjust entity offsets if needed
+    new_entities = entities or []
     if len(lines) > 1:
-        random.shuffle(lines)
-    text = '\n'.join(lines)
+        random.shuffle(lines)  # Shuffle non-essential lines
+        if new_entities:
+            # Recompute entity offsets after shuffling
+            new_text = '\n'.join(lines)
+            offset_map = {}
+            original_pos = 0
+            new_pos = 0
+            for orig_line, new_line in zip(text.split('\n'), new_text.split('\n')):
+                offset_map[original_pos] = new_pos
+                original_pos += len(orig_line) + 1
+                new_pos += len(new_line) + 1
+            adjusted_entities = []
+            for ent in new_entities:
+                start = ent.offset
+                end = ent.offset + ent.length
+                new_start = offset_map.get(start, start)
+                new_length = ent.length
+                adjusted_entities.append(type(ent)(offset=new_start, length=new_length, **ent.__dict__))
+            new_entities = adjusted_entities
+        text = new_text.strip()
+    else:
+        text = '\n'.join(lines).strip()
+
+    # Randomly add unique suffix or mutation
     if random.random() < 0.3:
-        emojis = ['😊', '👍', '🔥']
-        text = f"{text} {random.choice(emojis)}"
+        suffixes = ['😊', '👍', '🔥', '.', '..', '...']
+        suffix = f" {random.choice(suffixes)}"
+        text = text + suffix
+        if new_entities:
+            new_entities = [ent for ent in new_entities if ent.offset + ent.length <= len(text) - len(suffix)]
     if random.random() < 0.2:
-        text = text + '\u200B'  # Zero-width space
-    return text.strip()
+        line_ending = '\n' if random.random() < 0.5 else '\r\n'
+        text = text + line_ending.strip()
+    if random.random() < 0.1:
+        text = text + '\u200B'  # Controlled zero-width space
+        if new_entities:
+            new_entities = [ent for ent in new_entities if ent.offset + ent.length <= len(text) - 1]
+    
+    return text.strip(), new_entities
 
 def calculate_image_hash(img_bytes):
     """Calculate MD5 hash of image bytes."""
@@ -176,13 +229,16 @@ def remove_mentions_entities(text, entities):
     return new_text.strip(), new_entities
 
 def clean_image(image):
-    """Clean EXIF and modify image slightly to break perceptual hashing."""
+    """Clean EXIF and modify image to break perceptual hashing."""
     try:
         image = image.convert('RGB')
-        new_image = Image.new('RGB', (image.width + 1, image.height + 1), (0, 0, 0, 0))
-        new_image.paste(image, (0, 0))
+        pixels = image.load()
+        for x in range(0, eight.width, 20):
+            for y in range(0, image.height, 20):
+                r, g, b = pixels[x, y]
+                pixels[x, y] = (r ^ 1, g ^ 1, b ^ 1)  # Flip 1 bit to disrupt pHash/dHash
         output = io.BytesIO()
-        new_image.save(output, format='JPEG')
+        image.save(output, format='JPEG')
         return output.getvalue()
     except Exception as e:
         logger.error(f"Error cleaning image: {e}")
@@ -279,6 +335,20 @@ async def copy_message_with_retry(event, mapping, user_id, pair_name):
                 pair_stats[user_id][pair_name]['blocked'] += 1
                 return True
 
+            # Check for known trap variants
+            if any(p.lower() in text_lower for p in TRAP_VARIANTS):
+                reason = "Known trap pattern detected"
+                await notify_trap(event, mapping, pair_name, reason)
+                pair_stats[user_id][pair_name]['blocked'] += 1
+                return True
+
+            # Check for trap links
+            if re.search(r"https?://(fxleaks|track|redirect|trk)\.", text_lower, re.IGNORECASE):
+                reason = "Trap link detected"
+                await notify_trap(event, mapping, pair_name, reason)
+                pair_stats[user_id][pair_name]['blocked'] += 1
+                return True
+
             # Text cleaning
             if message_text:
                 message_text = remove_patterns(message_text, mapping.get('header_patterns', []))
@@ -288,22 +358,33 @@ async def copy_message_with_retry(event, mapping, user_id, pair_name):
                     message_text, original_entities = remove_mentions_entities(message_text, original_entities)
                 if is_reply and mapping.get('content_scramble', False):
                     message_text = re.sub(r'^>\s.*?\n', '', message_text, flags=re.MULTILINE)
-                message_text = scramble_content(message_text, mapping)
+                if scramble_content_enabled and mapping.get('content_scramble', False):
+                    message_text, original_entities = scramble_content_safe(message_text, original_entities)
                 message_text = apply_custom_header_footer(
                     message_text, mapping.get('custom_header', ''), mapping.get('custom_footer', '')
                 )
                 if message_text != event.message.raw_text:
                     original_entities = None
 
+            # Log text fingerprint
+            if message_text:
+                log_fingerprint(message_text, datetime.now().isoformat(), pair_name)
+
             # Preserve formatting if text was modified
             if original_entities is None and message_text:
                 message_text, original_entities = await client._parse_message_text(message_text, parse_mode='html')
 
-            # Random delay with jitter
+            # Random delay with jitter for anti-time slot fingerprinting
             delay_range = REPLY_DELAY_RANGE if is_reply else mapping.get('delay_range', DEFAULT_DELAY_RANGE)
-            delay = random.uniform(delay_range[0], delay_range[1]) + random.uniform(-JITTER, JITTER)
+            if FAST_MODE:
+                base_delay = random.uniform(*DEFAULT_DELAY_RANGE) + random.uniform(-0.2, 0.2)
+                anti_fingerprint_delay = random.uniform(*ANTI_FINGERPRINT_DELAY_RANGE)
+                total_delay = max(0, base_delay + anti_fingerprint_delay)
+            else:
+                base_delay = random.uniform(*DEFAULT_DELAY_RANGE)
+                total_delay = base_delay
             if mapping.get('stealth_mode', True):
-                await asyncio.sleep(max(0, delay))
+                await asyncio.sleep(total_delay)
 
             # Send message
             if processed_media := await process_media(event, mapping):
@@ -400,6 +481,24 @@ async def edit_copied_message(event, mapping, user_id, pair_name):
             pair_stats[user_id][pair_name]['deleted'] += 1
             return
 
+        # Check for known trap variants
+        if any(p.lower() in text_lower for p in TRAP_VARIANTS):
+            reason = "Known trap pattern in edited text"
+            await notify_trap(event, mapping, pair_name, reason)
+            await client.delete_messages(int(mapping['destination']), [forwarded_msg_id])
+            pair_stats[user_id][pair_name]['blocked'] += 1
+            pair_stats[user_id][pair_name]['deleted'] += 1
+            return
+
+        # Check for trap links
+        if re.search(r"https?://(fxleaks|track|redirect|trk)\.", text_lower, re.IGNORECASE):
+            reason = "Trap link in edited text"
+            await notify_trap(event, mapping, pair_name, reason)
+            await client.delete_messages(int(mapping['destination']), [forwarded_msg_id])
+            pair_stats[user_id][pair_name]['blocked'] += 1
+            pair_stats[user_id][pair_name]['deleted'] += 1
+            return
+
         # Text cleaning
         if message_text:
             message_text = remove_patterns(message_text, mapping.get('header_patterns', []))
@@ -409,12 +508,17 @@ async def edit_copied_message(event, mapping, user_id, pair_name):
                 message_text, original_entities = remove_mentions_entities(message_text, original_entities)
             if is_reply and mapping.get('content_scramble', False):
                 message_text = re.sub(r'^>\s.*?\n', '', message_text, flags=re.MULTILINE)
-            message_text = scramble_content(message_text, mapping)
+            if scramble_content_enabled and mapping.get('content_scramble', False):
+                message_text, original_entities = scramble_content_safe(message_text, original_entities)
             message_text = apply_custom_header_footer(
                 message_text, mapping.get('custom_header', ''), mapping.get('custom_footer', '')
             )
             if message_text != event.message.raw_text:
                 original_entities = None
+
+        # Log text fingerprint
+        if message_text:
+            log_fingerprint(message_text, datetime.now().isoformat(), pair_name)
 
         # Process media
         processed_media = await process_media(event, mapping)
@@ -554,6 +658,7 @@ async def list_commands(event):
 - `/resumeall` - Resume all pairs
 - `/clearpairs` - Remove all pairs
 - `/setdelay <name> <min> <max>` - Set random delay range
+- `/setfastmode <on|off>` - Toggle fast mode
 - `/status <name>` - Check pair status
 - `/report` - View pair stats
 - `/monitor` - Detailed pair monitor
@@ -584,6 +689,38 @@ async def list_commands(event):
 - `/showtraps <pair>` - Show trap filters
 """
     await event.reply(commands)
+
+@client.on(events.NewMessage(pattern=r'/setfastmode (on|off)'))
+async def toggle_fast_mode(event):
+    """Toggle FAST_MODE to adjust delays and worker count."""
+    global FAST_MODE, DEFAULT_DELAY_RANGE, ANTI_FINGERPRINT_DELAY_RANGE, NUM_WORKERS, worker_tasks
+    arg = event.pattern_match.group(1).lower()
+    if arg == "on":
+        FAST_MODE = True
+        DEFAULT_DELAY_RANGE = [0.5, 1.5]
+        ANTI_FINGERPRINT_DELAY_RANGE = [0.5, 1.5]
+        old_num_workers = NUM_WORKERS
+        NUM_WORKERS = 10
+        await event.reply("🚀 FAST MODE ENABLED\nBot will forward quickly with stealth.")
+    else:
+        FAST_MODE = False
+        DEFAULT_DELAY_RANGE = [1, 5]
+        ANTI_FINGERPRINT_DELAY_RANGE = [2, 5]
+        old_num_workers = NUM_WORKERS
+        NUM_WORKERS = 5
+        await event.reply("🐢 NORMAL MODE ENABLED\nStandard delay and throughput restored.")
+
+    # Adjust worker tasks
+    if old_num_workers != NUM_WORKERS:
+        # Cancel existing worker tasks
+        for task in worker_tasks:
+            task.cancel()
+        worker_tasks.clear()
+        # Start new worker tasks
+        for _ in range(NUM_WORKERS):
+            task = asyncio.create_task(queue_worker())
+            worker_tasks.append(task)
+        logger.info(f"Adjusted to {NUM_WORKERS} queue workers.")
 
 @client.on(events.NewMessage(pattern=r'/setpair (\S+) (\S+) (\S+)(?: (yes|no))?'))
 async def set_pair(event):
@@ -1273,6 +1410,7 @@ async def send_periodic_report():
 async def main():
     """Start the bot."""
     load_mappings()
+    global worker_tasks
     tasks = [
         check_connection_status(),
         send_periodic_report(),
@@ -1280,9 +1418,9 @@ async def main():
         check_queue_inactivity()
     ]
     for _ in range(NUM_WORKERS):
-        tasks.append(queue_worker())
-    for task in tasks:
-        asyncio.create_task(task)
+        task = asyncio.create_task(queue_worker())
+        worker_tasks.append(task)
+    tasks.extend(worker_tasks)
 
     try:
         await client.start()
